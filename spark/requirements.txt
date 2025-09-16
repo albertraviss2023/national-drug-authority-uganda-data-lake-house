@@ -1,0 +1,15 @@
+pytest
+pyspark[sql]
+jupyterlab==4.4.5
+pyiceberg[pyarrow,duckdb,pandas]==0.7.1 
+jupysql==0.10.12 
+chispa
+pyarrow>=14.0.0 
+pandas>=1.5.3 
+duckdb>=0.10.0
+grpcio>=1.48.1
+ipython-sql
+sql
+sqlalchemy
+posthog==2.5.0
+findspark

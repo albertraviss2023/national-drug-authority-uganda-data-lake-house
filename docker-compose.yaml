@@ -1,0 +1,328 @@
+services:
+  spark-master:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: spark-master
+    networks:
+      pipeline_net:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      minio:
+        condition: service_started
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - ./data:/home/iceberg/data
+      - ./spark_jobs:/opt/spark_jobs
+      - ./logs:/opt/spark_logs:rw
+      - ./spark/conf/spark-master.conf:/opt/spark/conf/spark-defaults.conf
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_IMPL=org.apache.iceberg.rest.RESTCatalog
+      - CATALOG_URI=http://iceberg-rest:8181
+      - CATALOG_BACKEND_IMPL=org.apache.iceberg.catalog.hadoop.HadoopCatalog
+      - CATALOG_BACKEND_WAREHOUSE=s3://warehouse/
+
+    ports:
+      - 8888:8888
+      - 7077:7077
+      - 8081:8080
+      - 10000:10000
+      - 10001:10001
+      - 4040-4042:4040-4042
+    command: ["/opt/start-spark-jupyter-server.sh", "master"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    container_name: spark-worker
+    networks:
+      pipeline_net:
+    depends_on:
+      - spark-master
+      - rest
+      - minio
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - ./data:/home/iceberg/data
+      - ./spark_jobs:/opt/spark_jobs
+      - ./logs:/opt/spark_logs:rw
+      - ./spark/conf/spark-worker.conf:/opt/spark/conf/spark-defaults.conf
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_PORT=7078
+      - SPARK_WORKER_WEBUI_PORT=8081
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_IMPL=org.apache.iceberg.rest.RESTCatalog
+      - CATALOG_URI=http://iceberg-rest:8181
+      - CATALOG_BACKEND_IMPL=org.apache.iceberg.catalog.hadoop.HadoopCatalog
+      - CATALOG_BACKEND_WAREHOUSE=s3://warehouse/
+      
+    ports:
+      - 7078:7078
+      - 8082:8081
+    command: ["/opt/start-spark-jupyter-server.sh", "worker"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2048M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: iceberg-rest
+    networks:
+      pipeline_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_IMPL=org.apache.iceberg.rest.RESTCatalog
+      - CATALOG_BACKEND_IMPL=org.apache.iceberg.catalog.hadoop.HadoopCatalog
+      - CATALOG_BACKEND_WAREHOUSE=s3://warehouse/
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+      - MINIO_DOMAIN=minio
+    networks:
+      pipeline_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      pipeline_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin123) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      tail -f /dev/null
+      "
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      pipeline_net:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    env_file:
+      .env
+
+  airflow-init:
+    build:
+      context: airflow/
+      dockerfile: Dockerfile
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - AIRFLOW__CORE__FERNET_KEY=${FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW__WEBSERVER__SECRET_KEY}
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=false
+      - _AIRFLOW_DB_MIGRATE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+    command: ["bash", "-c", "airflow db init && (airflow users list | grep -q admin || airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com)"]
+    restart: on-failure
+    networks:
+      pipeline_net:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    env_file:
+      .env
+
+  airflow-webserver:
+    build:
+      context: airflow/
+      dockerfile: Dockerfile
+    container_name: airflow-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - AIRFLOW__CORE__FERNET_KEY=${FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW__WEBSERVER__SECRET_KEY}
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=false
+      - AIRFLOW__CORE__BASE_LOG_FOLDER=/opt/airflow/logs
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs:rw
+      - ./spark_jobs:/opt/spark_jobs
+      - ./warehouse:/opt/airflow/warehouse
+      - ./data:/opt/airflow/data
+      - ./notebooks:/opt/airflow/notebooks
+
+    ports:
+      - "8080:8080"
+    command: ["airflow", "webserver"]
+    restart: always
+    networks:
+      pipeline_net:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  airflow-scheduler:
+    build:
+      context: airflow/
+      dockerfile: Dockerfile
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - AIRFLOW__CORE__FERNET_KEY=${FERNET_KEY}
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW__WEBSERVER__SECRET_KEY}
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=false
+      - AIRFLOW__CORE__BASE_LOG_FOLDER=/opt/airflow/logs
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_REGION=us-east-1
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs:rw
+      - ./spark_jobs:/opt/spark_jobs
+      - ./warehouse:/opt/airflow/warehouse
+      - ./data:/opt/airflow/data
+      - ./notebooks:/opt/airflow/notebooks
+
+    command: ["airflow", "scheduler"]
+    restart: always
+    networks:
+      pipeline_net:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  warehouse:
+  data:
+  logs:
+networks:
+  pipeline_net:

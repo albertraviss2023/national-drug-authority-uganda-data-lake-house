@@ -1,0 +1,18 @@
+{
+  // Theme
+  // @jupyterlab/apputils-extension:themes
+  // Theme manager settings.
+  // *************************************
+
+  // Selected Theme: Light variant for better visibility in daylight
+  "theme": "JupyterLab Light",
+
+  // Prefer system theme (set false for consistent experience)
+  "themeScrollbars": true,
+
+  // Optional: Set font settings for readability
+  "fontSize": 14,
+  "codeCellConfig": {
+    "lineNumbers": true
+  }
+}

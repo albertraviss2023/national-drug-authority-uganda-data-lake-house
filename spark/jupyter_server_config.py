@@ -1,0 +1,9 @@
+c = get_config()
+c.ServerApp.ip = '0.0.0.0'  # Allow connections from any IP
+c.ServerApp.port = 8888      # Use port 8888
+c.ServerApp.token = ''       # Disable token for simplicity (secure in production)
+c.ServerApp.password = ''    # Disable password for simplicity (secure in production)
+c.ServerApp.notebook_dir = '/home/iceberg/notebooks/notebooks'  # Set to mounted volume
+c.ServerApp.terminado_settings = {'shell_command': ['/usr/bin/zsh']}  # Use zsh for terminal
+c.ServerApp.allow_root = True  # Allow running as root
+c.ServerApp.open_browser = False  # Prevent browser auto-open
