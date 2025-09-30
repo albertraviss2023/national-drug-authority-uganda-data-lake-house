@@ -39,7 +39,7 @@ services:
     ports:
       - 8888:8888
       - 7077:7077
-      - 8081:8080
+      - 8082:8080
       - 10000:10000
       - 10001:10001
       - 4040-4042:4040-4042
@@ -89,7 +89,7 @@ services:
       
     ports:
       - 7078:7078
-      - 8082:8081
+      - 8081:8081
     command: ["/opt/start-spark-jupyter-server.sh", "worker"]
     deploy:
       resources:
@@ -145,6 +145,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    volumes:
+    - minio_data:/data
 
   mc:
     depends_on:
@@ -158,13 +160,16 @@ services:
       - AWS_SECRET_ACCESS_KEY=minioadmin123
       - AWS_REGION=us-east-1
     entrypoint: >
-      /bin/sh -c "
-      until (/usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin123) do echo '...waiting...' && sleep 1; done;
-      /usr/bin/mc rm -r --force minio/warehouse;
-      /usr/bin/mc mb minio/warehouse;
-      /usr/bin/mc policy set public minio/warehouse;
-      tail -f /dev/null
-      "
+      /bin/sh -c ' 
+      set -e
+      until /usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin123; do echo "...waiting for MinIO..." && sleep 1; done
+      /usr/bin/mc mb minio/warehouse || true
+      echo bronze | /usr/bin/mc pipe minio/warehouse/bronze/.keep
+      echo silver | /usr/bin/mc pipe minio/warehouse/silver/.keep
+      echo gold   | /usr/bin/mc pipe minio/warehouse/gold/.keep
+      /usr/bin/mc anonymous set download minio/warehouse || true
+      tail -f /dev/null '
+      
     logging:
       driver: json-file
       options:
@@ -227,6 +232,8 @@ services:
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin123
       - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=${CATALOG_WAREHOUSE}
+      - CATALOG_S3_ENDPOINT=${CATALOG_S3_ENDPOINT}
     command: ["bash", "-c", "airflow db init && (airflow users list | grep -q admin || airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com)"]
     restart: on-failure
     networks:
@@ -261,6 +268,9 @@ services:
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin123
       - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=${CATALOG_WAREHOUSE}
+      - CATALOG_S3_ENDPOINT=${CATALOG_S3_ENDPOINT}
+    
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs:rw
@@ -270,7 +280,7 @@ services:
       - ./notebooks:/opt/airflow/notebooks
 
     ports:
-      - "8080:8080"
+      - "8088:8080"
     command: ["airflow", "webserver"]
     restart: always
     networks:
@@ -301,6 +311,8 @@ services:
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin123
       - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=${CATALOG_WAREHOUSE}
+      - CATALOG_S3_ENDPOINT=${CATALOG_S3_ENDPOINT}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs:rw
@@ -324,5 +336,6 @@ volumes:
   warehouse:
   data:
   logs:
+  minio_data:
 networks:
   pipeline_net:

@@ -1,1 +1,0 @@
-$env:COMPOSE_BAKE = "true"

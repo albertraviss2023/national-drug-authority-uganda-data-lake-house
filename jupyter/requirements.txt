@@ -1,9 +1,8 @@
 pytest
 pyspark[sql]
-jupyterlab==4.2.5 
+jupyterlab
 pyiceberg[pyarrow,duckdb,pandas]==0.7.1 
 jupysql==0.10.12 
 chispa
 pyarrow>=14.0.0 
 pandas>=1.5.3 
-duckdb>=0.10.0
