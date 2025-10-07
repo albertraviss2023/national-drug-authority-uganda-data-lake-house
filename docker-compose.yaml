@@ -16,7 +16,7 @@ services:
     volumes:
       - ./warehouse:/home/iceberg/warehouse
       - ./notebooks:/home/iceberg/notebooks/notebooks
-      - ./data:/home/iceberg/data
+      - ./data:/home/iceberg/data:rw
       - ./spark_jobs:/opt/spark_jobs
       - ./logs:/opt/spark_logs:rw
       - ./spark/conf/spark-master.conf:/opt/spark/conf/spark-defaults.conf
@@ -65,7 +65,7 @@ services:
     volumes:
       - ./warehouse:/home/iceberg/warehouse
       - ./notebooks:/home/iceberg/notebooks/notebooks
-      - ./data:/home/iceberg/data
+      - ./data:/home/iceberg/data:rw
       - ./spark_jobs:/opt/spark_jobs
       - ./logs:/opt/spark_logs:rw
       - ./spark/conf/spark-worker.conf:/opt/spark/conf/spark-defaults.conf
@@ -276,7 +276,7 @@ services:
       - ./logs:/opt/airflow/logs:rw
       - ./spark_jobs:/opt/spark_jobs
       - ./warehouse:/opt/airflow/warehouse
-      - ./data:/opt/airflow/data
+      - ./data:/opt/airflow/data:rw
       - ./notebooks:/opt/airflow/notebooks
 
     ports:
@@ -318,7 +318,7 @@ services:
       - ./logs:/opt/airflow/logs:rw
       - ./spark_jobs:/opt/spark_jobs
       - ./warehouse:/opt/airflow/warehouse
-      - ./data:/opt/airflow/data
+      - ./data:/opt/airflow/data:rw
       - ./notebooks:/opt/airflow/notebooks
 
     command: ["airflow", "scheduler"]
