@@ -46,4 +46,6 @@ RUN pip3 install --no-cache-dir --upgrade pip && \
         confluent-kafka==2.5.0 \
         minio==7.2.8 \
         pymssql==2.2.11 \
-        papermill
+        papermill \
+        duckdb==1.1.2 \
+        pyarrow>=14
