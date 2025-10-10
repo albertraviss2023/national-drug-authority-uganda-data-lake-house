@@ -12,7 +12,7 @@ from airflow.operators.python import PythonOperator
 CATALOG_WAREHOUSE = os.environ["CATALOG_WAREHOUSE"]          # e.g., s3://warehouse
 CATALOG_S3_ENDPOINT = os.environ["CATALOG_S3_ENDPOINT"]      # e.g., http://minio:9000
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-FORCE_RUN_DAY = os.environ.get("GCP_SILVER_RUN_DAY", "").strip()  # optional YYYYMMDD (backfill)
+FORCE_RUN_DAY = os.environ.get("GCP_SILVER_RUN_DAY", "").strip()  # optional YYYYMMDD
 
 # ---------- CONSTANTS ----------
 DIRECTORATE = "dps"
@@ -90,6 +90,7 @@ def _safe_to_datetime(series, *, dayfirst=True):
         except Exception:
             try:  return series.dt.tz_localize("UTC")
             except Exception: return series
+    # ✅ Excel serials support
     if is_integer_dtype(series) or is_float_dtype(series):
         return pd.to_datetime(series, errors="coerce", unit="D", origin="1899-12-30", utc=True)
     if is_object_dtype(series) or is_string_dtype(series):
@@ -115,17 +116,28 @@ def _to_bool(series):
 
 def _to_binary_status(series):
     import pandas as pd
+    # normalize to lowercase strings; keep dtype "string" but avoid NA in logic
     s = series.astype("string").str.strip().str.lower()
+    # normalize punctuation/spacing (handles "non-compliant", "non compliant", etc.)
     s = s.str.replace(r"[\-/]", " ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
-    compliant = {"compliant","yes","y","ok","pass","passed","meets","meets requirements","c"}
-    noncompliant = {"non compliant","noncompliant","non_compliant","no","n","fail","failed","does not meet","nc"}
-    def decide(v):
-        if v is None or v == "" or v in {"na","n/a","null","none"}: return None
-        lv = v.lower()
-        if lv in compliant: return "compliant"
-        if lv in noncompliant or lv.startswith("non "): return "non_compliant"
-        return "non_compliant"  # binary default
-    return s.map(decide)
+    s2 = s.fillna("")
+
+    compliant = {
+        "compliant","yes","y","ok","pass","passed","meets","meets requirements","c"
+    }
+    noncompliant = {
+        "non compliant","noncompliant","non_compliant","no","n","fail","failed",
+        "does not meet","nc","not compliant","not_compliant"
+    }
+
+    out = pd.Series("non_compliant", index=s2.index, dtype="string")
+    mask_compliant = s2.isin(compliant)
+    mask_non = s2.isin(noncompliant) | s2.str.startswith("non ")
+
+    out[mask_compliant] = "compliant"
+    out[~mask_compliant & ~mask_non & (s2 == "")] = pd.NA  # keep true missing as NA
+
+    return out
 
 def _report_ym_series(s):
     import pandas as pd
@@ -169,7 +181,7 @@ def _build_inspection_id(df):
 def _boto3():
     import boto3
     from botocore.client import Config
-    return boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=AWS_REGION,
+    return boto3.client("s3", endpoint_url=CATALOG_S3_ENDPOINT, region_name=AWS_REGION,
                         config=Config(signature_version="s3v4"))
 
 def _list_sheets(s3) -> List[str]:
@@ -189,7 +201,6 @@ def _latest_day(s3) -> Optional[str]:
     return max(days) if days else None
 
 def _list_parquet_pairs_for_day(s3, day: str) -> List[Tuple[str,str,str]]:
-    """Return (sheet, day, bronze_key) for each parquet under bronze."""
     pairs = []
     for sheet in _list_sheets(s3):
         prefix = f"{BRONZE_ROOT}/{sheet}/{day}/"
@@ -216,7 +227,6 @@ def _mk_out_key(sheet: str, day: str, bronze_filename: str) -> str:
     return f"{SILVER_ROOT}/{sheet}/{day}/{base}_clean.parquet"
 
 def _file_marker_key(sheet: str, day: str, bronze_key: str) -> str:
-    # one marker per bronze object, placed under a stable namespace
     digest = hashlib.sha1(bronze_key.encode("utf-8")).hexdigest()
     return f"_processed_markers/silver/{DIRECTORATE}/{DATASET}/{sheet}/{day}/{digest}.done"
 
@@ -250,16 +260,14 @@ def bronze_to_silver_gcp_mirror():
         out_key = _mk_out_key(sheet, d, src_file)
         marker_key = _file_marker_key(sheet, d, bronze_key)
 
-        # idempotency: skip if marker OR output already exists
+        # idempotency
         if s3.list_objects_v2(Bucket=BUCKET, Prefix=marker_key, MaxKeys=1).get("KeyCount", 0) > 0:
             print(f"[Skip] Marker exists → {bronze_key}"); continue
         if s3.list_objects_v2(Bucket=BUCKET, Prefix=out_key, MaxKeys=1).get("KeyCount", 0) > 0:
-            print(f"[Skip] Output exists → s3://{BUCKET}/{out_key}"); 
-            # still write a marker to stop further re-evals
+            print(f"[Skip] Output exists → s3://{BUCKET}/{out_key}")
             s3.put_object(Bucket=BUCKET, Key=marker_key, Body=b"{}", ContentType="application/json")
             continue
 
-        # read bronze
         p = _download_to_tmp(s3, bronze_key)
         try:
             raw = pd.read_parquet(p)
@@ -269,24 +277,20 @@ def bronze_to_silver_gcp_mirror():
         finally:
             p.unlink(missing_ok=True)
 
-        # cleaning pipeline
         df = _maybe_promote_header(raw)
         df = _canonize_columns(df)
 
-        # parse dates (incl. actual_date/report/capa dates)
         for c in list(df.columns):
             lc = c.lower()
             if lc in {"actual_date","date_of_report","date_of_capa_verification"} or \
                "date" in lc or lc.endswith("_at") or lc.endswith("_on"):
                 df[c] = _safe_to_datetime(df[c], dayfirst=True)
 
-        # preferred actual_date
         if "actual_date" not in df.columns:
             df["actual_date"] = None
         if "date_of_report" in df.columns:
             df["actual_date"] = df["actual_date"].where(~df["actual_date"].isna(), df["date_of_report"])
 
-        # types + strings
         for c in df.columns:
             if str(df[c].dtype).startswith("datetime"): continue
             if df[c].dtype == "object":
@@ -295,43 +299,34 @@ def bronze_to_silver_gcp_mirror():
                 df[c] = df[c].astype("string")
         df = _clean_strings(df)
 
-        # binary status + CAPA
         if "compliance_status" in df.columns:
             df["compliance_status"] = _to_binary_status(df["compliance_status"])
         if "capa_verified" in df.columns:
             df["capa_verified"] = _to_bool(df["capa_verified"])
 
-        # ensure columns
         for col in _SILVER_COLS:
             if col not in df.columns: df[col] = None
 
-        # derived
         df["report_year_month"] = _report_ym_series(df["actual_date"])
 
-        # lineage
         df["source_sheet"] = sheet
         df["source_file"] = src_file
         df["bronze_run_day"] = d
         df["silver_marked_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # order + filter empties
         df = df[_SILVER_COLS]
         keep_mask = df[["title","cta_number","pi","actual_date","date_of_report"]].notna().any(axis=1)
         df = df[keep_mask].copy()
 
-        # inspection_id (vectorized)
         df["inspection_id"] = _build_inspection_id(df)
 
-        # de-dupe within file
         df = df.sort_values(["actual_date","title"], na_position="last") \
                .drop_duplicates(subset=["inspection_id"], keep="first")
 
-        # ensure target prefix exists
         out_prefix = f"{SILVER_ROOT}/{sheet}/{d}/"
         if s3.list_objects_v2(Bucket=BUCKET, Prefix=out_prefix, MaxKeys=1).get("KeyCount", 0) == 0:
             s3.put_object(Bucket=BUCKET, Key=out_prefix + ".keep", Body=b"")
 
-        # write using STABLE filename (no timestamp)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".parquet") as tmpf:
             out_path = Path(tmpf.name)
         try:
@@ -343,14 +338,9 @@ def bronze_to_silver_gcp_mirror():
         total_out += len(df)
         print(f"[Silver] Wrote {len(df):,} → s3://{BUCKET}/{out_key}")
 
-        # marker
         manifest = {
-            "bronze_key": bronze_key,
-            "sheet": sheet,
-            "day": d,
-            "output": out_key,
-            "rows": int(len(df)),
-            "marked_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "bronze_key": bronze_key, "sheet": sheet, "day": d, "output": out_key,
+            "rows": int(len(df)), "marked_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         s3.put_object(Bucket=BUCKET, Key=marker_key, Body=json.dumps(manifest).encode("utf-8"),
                       ContentType="application/json")
@@ -361,7 +351,7 @@ def bronze_to_silver_gcp_mirror():
 with DAG(
     dag_id="silver_dps_gcp_mirror",
     start_date=datetime(2025, 9, 1),
-    schedule=None,      # manual / triggered only
+    schedule=None,
     catchup=False,
     default_args={"owner": "airflow"},
     tags=["silver", "dps", "gcp", "mirror", "no-spark"],

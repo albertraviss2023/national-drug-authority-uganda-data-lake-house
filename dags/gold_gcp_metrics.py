@@ -27,8 +27,12 @@ S3_ENDPOINT = CATALOG_S3_ENDPOINT
 def _boto3():
     import boto3
     from botocore.client import Config
-    return boto3.client("s3", endpoint_url=S3_ENDPOINT, region_name=AWS_REGION,
-                        config=Config(signature_version="s3v4"))
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        region_name=AWS_REGION,
+        config=Config(signature_version="s3v4")
+    )
 
 def _list_all_silver_parquet_keys(s3, day: str | None = None):
     keys = []
@@ -60,7 +64,15 @@ def _download_keys_to_tmp(s3, keys):
 
 def _ensure_gold_prefixes():
     s3 = _boto3()
-    for sub in ("overview", "monthly_totals", "monthly_by_status", "fy_totals", "by_pi", "by_site"):
+    for sub in (
+        "snapshot",
+        "overview",
+        "monthly_totals",
+        "monthly_by_status",
+        "fy_totals",
+        "by_pi",
+        "by_site",
+    ):
         base = f"{GOLD_ROOT}/{sub}/"
         if s3.list_objects_v2(Bucket=BUCKET, Prefix=base, MaxKeys=1).get("KeyCount", 0) == 0:
             s3.put_object(Bucket=BUCKET, Key=base + ".keep", Body=b"")
@@ -89,28 +101,25 @@ def _latest_silver_day(s3) -> str | None:
 def compute_kpis_from_silver():
     import duckdb
     import pandas as pd
-
     s3 = _boto3()
     run_day = FORCE_SILVER_DAY or _latest_silver_day(s3)
     if not run_day:
-        print("[Gold] No silver partitions found.")
-        return
+        print("[Gold] No silver partitions found."); return
 
     keys = _list_all_silver_parquet_keys(s3, day=run_day)
     if not keys:
-        print(f"[Gold] No silver parquet files for day={run_day}")
-        return
+        print(f"[Gold] No silver parquet files for day={run_day}"); return
 
     tmpdir = _download_keys_to_tmp(s3, keys)
     print(f"[Local] Downloaded {len(keys)} silver parquet(s) to {tmpdir}")
 
     try:
-        # Read everything with union_by_name to tolerate schema drift
-        duckdb.sql("INSTALL json; LOAD json;")  # harmless if already present
-        rel = duckdb.read_parquet(f"{tmpdir}/*.parquet", union_by_name=True)
-        rel.create_view("silver")
+        duckdb.sql("INSTALL json; LOAD json;")
+        duckdb.read_parquet(f"{tmpdir}/*.parquet", union_by_name=True).create_view("silver")
 
-        # Normalize compliance_status and (re)derive fiscal year & month from actual_date
+        # <<< this line fixes your error >>>
+        duckdb.sql("DROP VIEW IF EXISTS silver_norm")
+
         duckdb.sql("""
             CREATE OR REPLACE VIEW silver_norm AS
             WITH base AS (
@@ -121,35 +130,48 @@ def compute_kpis_from_silver():
                 CAST(sites AS VARCHAR)        AS sites,
                 CAST(justification_for_inspection AS VARCHAR) AS justification_for_inspection,
                 CAST(inspectors AS VARCHAR)   AS inspectors,
-                /* ensure TIMESTAMP */
+                CAST(source_sheet AS VARCHAR) AS source_sheet,
                 CAST(actual_date AS TIMESTAMP) AS actual_date,
-                /* normalize status to 3 buckets */
                 CASE
-                  WHEN lower(trim(CAST(compliance_status AS VARCHAR))) IN ('compliant','yes','y','true','1') THEN 'compliant'
-                  WHEN lower(trim(CAST(compliance_status AS VARCHAR))) IN ('non_compliant','non-compliant','non compliant','no','n','false','0','not_compliant') THEN 'non_compliant'
-                  ELSE 'unknown'
+                  WHEN lower(trim(CAST(compliance_status AS VARCHAR))) IN
+                       ('compliant','yes','y','true','1','pass','passed','ok','meets','meets requirements','c')
+                    THEN 'compliant'
+                  WHEN CAST(compliance_status AS VARCHAR) IS NULL OR trim(CAST(compliance_status AS VARCHAR)) = ''
+                    THEN NULL
+                  ELSE 'non_compliant'
                 END AS compliance_status,
                 CAST(inspection_id AS VARCHAR) AS inspection_id
               FROM silver
             ),
-            derived AS (
+            with_sheet_fy AS (
               SELECT
                 *,
-                /* Uganda FY: Jul–Jun */
+                REGEXP_EXTRACT(source_sheet, '(?:^|[^0-9])(?:(?:fy)[-_]?)?(\\d{4})[_-]?(\\d{2,4})', 1) AS fy_a,
+                REGEXP_EXTRACT(source_sheet, '(?:^|[^0-9])(?:(?:fy)[-_]?)?(\\d{4})[_-]?(\\d{2,4})', 2) AS fy_b_raw
+              FROM base
+            ),
+            derived AS (
+              SELECT
+                title, cta_number, pi, sites, justification_for_inspection, inspectors, source_sheet,
+                actual_date, compliance_status, inspection_id,
                 CASE
+                  WHEN fy_a IS NOT NULL AND fy_b_raw IS NOT NULL THEN
+                    CASE
+                      WHEN length(fy_b_raw)=2 THEN concat(fy_a, '_', concat(substr(fy_a,1,2), fy_b_raw))
+                      ELSE concat(fy_a, '_', fy_b_raw)
+                    END
                   WHEN actual_date IS NULL THEN NULL
                   WHEN EXTRACT(MONTH FROM actual_date) >= 7
                     THEN concat(EXTRACT(YEAR FROM actual_date)::INT, '_', (EXTRACT(YEAR FROM actual_date)::INT + 1))
                   ELSE concat((EXTRACT(YEAR FROM actual_date)::INT - 1), '_', EXTRACT(YEAR FROM actual_date)::INT)
                 END AS fiscal_year,
                 CAST(date_trunc('month', actual_date) AS DATE) AS report_month
-              FROM base
+              FROM with_sheet_fy
             )
             SELECT * FROM derived
         """)
 
         # KPIs
-
         overview = duckdb.sql("""
             SELECT
               COUNT(*)::BIGINT AS total_inspections,
@@ -158,40 +180,35 @@ def compute_kpis_from_silver():
             FROM silver_norm
         """).df()
 
+        snapshot = overview.copy()
+        tot  = int(snapshot["total_inspections"].iloc[0]) if len(snapshot) else 0
+        comp = int(snapshot["compliant_count"].iloc[0]) if len(snapshot) else 0
+        snapshot["compliance_rate"] = (comp / tot) if tot else 0.0
+
         monthly_totals = duckdb.sql("""
-            SELECT
-              report_month AS month,
-              COUNT(*)::BIGINT AS total_inspections
+            SELECT report_month AS month, COUNT(*)::BIGINT AS total_inspections
             FROM silver_norm
             WHERE report_month IS NOT NULL
-            GROUP BY 1
-            ORDER BY 1
+            GROUP BY 1 ORDER BY 1
         """).df()
 
         monthly_by_status = duckdb.sql("""
-            SELECT
-              report_month AS month,
-              compliance_status,
-              COUNT(*)::BIGINT AS inspections
+            SELECT report_month AS month, compliance_status, COUNT(*)::BIGINT AS inspections
             FROM silver_norm
-            WHERE report_month IS NOT NULL
-            GROUP BY 1,2
-            ORDER BY 1,2
+            WHERE report_month IS NOT NULL AND compliance_status IN ('compliant','non_compliant')
+            GROUP BY 1,2 ORDER BY 1,2
         """).df()
 
         fy_totals = duckdb.sql("""
-            SELECT
-              fiscal_year,
-              COUNT(*)::BIGINT AS total_inspections
+            SELECT fiscal_year, COUNT(*)::BIGINT AS total_inspections
             FROM silver_norm
-            GROUP BY 1
-            ORDER BY 1
+            WHERE fiscal_year IS NOT NULL
+            GROUP BY 1 ORDER BY 1
         """).df()
 
         by_pi = duckdb.sql("""
-            SELECT
-              COALESCE(NULLIF(TRIM(pi), ''), 'Unknown') AS pi,
-              COUNT(*)::BIGINT AS inspections
+            SELECT COALESCE(NULLIF(TRIM(pi), ''), 'Unknown') AS pi,
+                   COUNT(*)::BIGINT AS inspections
             FROM silver_norm
             GROUP BY 1
             ORDER BY inspections DESC, pi
@@ -199,26 +216,23 @@ def compute_kpis_from_silver():
 
         by_site = duckdb.sql("""
             WITH exploded AS (
-            SELECT
-                TRIM(site) AS site
-            FROM (
+              SELECT TRIM(site) AS site
+              FROM (
                 SELECT UNNEST(regexp_split_to_array(COALESCE(sites, ''), ',|;')) AS site
                 FROM silver_norm
+              )
+              WHERE TRIM(site) <> ''
             )
-            WHERE TRIM(site) <> ''
-            )
-            SELECT
-            site,
-            COUNT(*)::BIGINT AS inspections
+            SELECT site, COUNT(*)::BIGINT AS inspections
             FROM exploded
             GROUP BY 1
             ORDER BY inspections DESC, site
         """).df()
 
-
-        # ---------- Write to S3 (gold) ----------
+        # Write to S3 (gold)
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         _ensure_gold_prefixes()
+
         def _upload_df(df: pd.DataFrame, subdir: str, name: str):
             out = Path(tempfile.mkstemp(prefix=f"{subdir}__", suffix=".parquet")[1])
             df.to_parquet(out, index=False)
@@ -229,21 +243,23 @@ def compute_kpis_from_silver():
             out.unlink(missing_ok=True)
             print(f"[Gold] Wrote {len(df):,} rows → s3://{BUCKET}/{key}")
 
-        _upload_df(overview,         "overview",          "overview")
-        _upload_df(monthly_totals,   "monthly_totals",    "monthly_totals")
-        _upload_df(monthly_by_status,"monthly_by_status", "monthly_by_status")
-        _upload_df(fy_totals,        "fy_totals",         "fy_totals")
-        _upload_df(by_pi,            "by_pi",             "by_pi")
-        _upload_df(by_site,          "by_site",           "by_site")
+        _upload_df(snapshot,          "snapshot",           "snapshot")
+        _upload_df(overview,          "overview",           "overview")
+        _upload_df(monthly_totals,    "monthly_totals",     "monthly_totals")
+        _upload_df(monthly_by_status, "monthly_by_status",  "monthly_by_status")
+        _upload_df(fy_totals,         "fy_totals",          "fy_totals")
+        _upload_df(by_pi,             "by_pi",              "by_pi")
+        _upload_df(by_site,           "by_site",            "by_site")
 
         marker_key = f"_processed_markers/gold/{DIRECTORATE}/{DATASET}/{run_day}.done"
         payload = {"run_day": run_day, "written_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "inputs": keys}
-        _boto3().put_object(Bucket=BUCKET, Key=marker_key, Body=json.dumps(payload).encode("utf-8"),
+        _boto3().put_object(Bucket=BUCKET, Key=marker_key,
+                            Body=json.dumps(payload).encode("utf-8"),
                             ContentType="application/json")
         print(f"[Marked] s3://{BUCKET}/{marker_key}")
-
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 # ---------- DAG ----------
 with DAG(
