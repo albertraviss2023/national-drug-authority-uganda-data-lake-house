@@ -1,4 +1,4 @@
 chispa
 pytest
-pyspark
+pyspark==3.5.7 --only-binary=:all:
 pyspark[sql]

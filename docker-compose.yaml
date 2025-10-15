@@ -101,6 +101,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    env_file:
+      .env
 
   rest:
     image: tabulario/iceberg-rest
@@ -124,6 +126,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    env_file:
+      .env
 
   minio:
     image: minio/minio
@@ -147,6 +151,11 @@ services:
         max-file: "3"
     volumes:
     - minio_data:/data
+    build:
+      context: contextPath
+      dockerfile: Dockerfile
+    env_file:
+      .env
 
   mc:
     depends_on:
@@ -175,6 +184,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    env_file:
+      .env
     
   postgres:
     image: postgres:15
@@ -290,6 +301,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    env_file:
+      .env
 
   airflow-scheduler:
     build:
@@ -330,6 +343,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    env_file:
+      .env
 
 volumes:
   postgres_data:

@@ -1,5 +1,4 @@
 pytest
-pyspark[sql]
 jupyterlab
 pyiceberg[pyarrow,duckdb,pandas]==0.7.1 
 jupysql==0.10.12 
@@ -12,3 +11,4 @@ sql
 sqlalchemy
 posthog==2.5.0
 findspark
+py4j==0.10.9.7

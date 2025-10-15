@@ -1,0 +1,280 @@
+# dags/ingest_bronze_td_data.py
+from __future__ import annotations
+import os
+import re
+import json
+from datetime import datetime
+from pathlib import Path
+
+from airflow.decorators import dag, task
+from airflow.models.param import Param
+
+# ---------- ENV ----------
+CATALOG_WAREHOUSE = os.environ["CATALOG_WAREHOUSE"]          # e.g., s3://warehouse
+CATALOG_S3_ENDPOINT = os.environ["CATALOG_S3_ENDPOINT"]      # e.g., http://minio:9000
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AIRFLOW_DATA_DIR = os.environ.get("AIRFLOW_DATA_DIR", "/opt/airflow/data")
+
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin123")
+
+# ---------- CONSTANTS ----------
+DIRECTORATE = "inspectorate"
+INBOX_DIR = Path(AIRFLOW_DATA_DIR) / "inspectorate" / "imports"   # recursive
+BRONZE_ROOT = f"bronze/{DIRECTORATE}/imports/td_data"             # s3 key prefix under BUCKET
+
+# Target schema (exact names + preferred dtypes)
+TARGET_COLS_IN_ORDER = [
+    "id","tracking_no","reference_no","SubmissionDate","query_ref","query_remark","queried_on","responded_on",
+    "NDAApplicationType","DeclarantType","buzzType","premise_reg_no","premise_name","Manufacturer","consignee_id",
+    "ConsigneeType","Consignee","ShipmentCategory","ShipmentMode","transportDocument","transport_document_number",
+    "ShipmentDate","expected_arrival_date","clearingAgent","pack_list_number","product_id","brand_name",
+    "permitbrand_name","manufacturer_name","atc_code_id","name","gmdn_code","approved_qty","qty_shipped",
+    "total_weight","batch_qty","batch_units","hs_code_id","hs_code_description","supplementary_value","pack_size",
+    "dosageFor","BatchNo","product_expiry_date","product_manufacturing_date","units_for_quantity","UNITofQuantity",
+    "pack_price","currency_id","Currency","vc_no","date_released","workflow_stage_name","created_by","no_of_packs"
+]
+DATE_COLS = {
+    "SubmissionDate","queried_on","responded_on","ShipmentDate","expected_arrival_date",
+    "product_expiry_date","product_manufacturing_date","date_released",
+}
+NUMERIC_COLS = {
+    "approved_qty","qty_shipped","total_weight","batch_qty","supplementary_value",
+    "pack_size","pack_price","no_of_packs",
+}
+
+# ---------- DERIVED ----------
+assert CATALOG_WAREHOUSE.startswith("s3://"), "CATALOG_WAREHOUSE must look like s3://bucket[/...]"
+BUCKET = CATALOG_WAREHOUSE.replace("s3://", "").split("/")[0]
+
+# ---------- HELPERS ----------
+def _norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(name).strip().lower()).strip("_")
+
+def _marker_suffix_for(path: Path) -> str:
+    # Unique suffix based on relative path under INBOX_DIR
+    rel = path.relative_to(INBOX_DIR).as_posix()
+    return re.sub(r"[^a-zA-Z0-9._/-]+", "_", rel)
+
+def _processed_marker_key(src: Path) -> str:
+    return f"_processed_markers/{DIRECTORATE}/imports/td_data/{_marker_suffix_for(src)}.done"
+
+def _is_already_processed(s3, bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3.exceptions.ClientError:
+        return False
+
+def _enforce_schema(df):
+    import pandas as pd
+    # Build lookup (normalized target -> exact target)
+    target_by_norm = { _norm(c): c for c in TARGET_COLS_IN_ORDER }
+
+    # Rename incoming columns toward the exact target
+    rename_map = {}
+    for c in df.columns:
+        norm = _norm(c)
+        if norm in target_by_norm:
+            rename_map[c] = target_by_norm[norm]
+    df = df.rename(columns=rename_map)
+
+    # Add any missing target columns
+    for c in TARGET_COLS_IN_ORDER:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # Keep only target columns in order
+    df = df[TARGET_COLS_IN_ORDER]
+
+    # Coerce types
+    for c in TARGET_COLS_IN_ORDER:
+        if c in DATE_COLS:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in TARGET_COLS_IN_ORDER:
+        if c in NUMERIC_COLS:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Float64")
+    for c in TARGET_COLS_IN_ORDER:
+        if c not in DATE_COLS and c not in NUMERIC_COLS:
+            if not str(df[c].dtype).startswith("datetime"):
+                df[c] = df[c].astype("string")
+    return df
+
+def _write_parquet_direct(df, key: str):
+    """Write directly to MinIO using PyArrow S3FileSystem."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.fs as pafs
+
+    fs = pafs.S3FileSystem(
+        access_key=AWS_ACCESS_KEY_ID,
+        secret_key=AWS_SECRET_ACCESS_KEY,
+        endpoint_override=CATALOG_S3_ENDPOINT,   # e.g., http://minio:9000
+        region=AWS_REGION,
+    )
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    # Direct write (no temp files). Snappy for speed; dictionary encoding helps strings.
+    pq.write_table(
+        table,
+        where=f"s3://{BUCKET}/{key}",
+        filesystem=fs,
+        compression="snappy",
+        use_dictionary=True,
+        data_page_size=1 << 20,   # ~1MB pages to balance speed/size
+    )
+
+# ---------- DAG ----------
+@dag(
+    dag_id="ingest_bronze_td_data",
+    start_date=datetime(2025, 9, 1),
+    schedule=None,
+    catchup=False,
+    tags=["bronze", "inspectorate", "imports", "parquet", "no-spark", "fast"],
+    default_args={"owner": "airflow"},
+    params={
+        # Optional param to limit recursion to a subfolder during tests
+        "subdir": Param("", type="string", description="Optional sub-folder under inspectorate/imports"),
+    },
+)
+def ingest_bronze_td_data():
+    @task
+    def ensure_prefixes():
+        import boto3
+        from botocore.client import Config
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=CATALOG_S3_ENDPOINT,
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+        )
+        base = f"{BRONZE_ROOT}/"
+        # Create a prefix marker (.keep) once
+        try:
+            s3.head_object(Bucket=BUCKET, Key=base + ".keep")
+            print(f"[Bronze] Prefix exists: s3://{BUCKET}/{base}")
+        except s3.exceptions.ClientError:
+            s3.put_object(Bucket=BUCKET, Key=base + ".keep", Body=b"")
+            print(f"[Bronze] Created prefix marker s3://{BUCKET}/{base}.keep")
+
+    @task
+    def list_excels(subdir: str = "") -> list[str]:
+        """Recursively list .xlsx and .xls under INBOX_DIR[/subdir]."""
+        base = INBOX_DIR / subdir if subdir else INBOX_DIR
+        if not base.exists():
+            print(f"[Ingest] Inbox missing: {base}")
+            return []
+        paths = list(base.rglob("*.xlsx")) + list(base.rglob("*.xls"))
+        print(f"[Ingest] Found {len(paths)} workbook(s) under {base}.")
+        return [str(p) for p in paths]
+
+    @task
+    def ingest_one(path: str):
+        import pandas as pd
+        import boto3
+        from botocore.client import Config
+
+        src = Path(path)
+        if not src.exists():
+            print(f"[Skip] Missing file: {src}")
+            return
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=CATALOG_S3_ENDPOINT,
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+        )
+
+        marker_key = _processed_marker_key(src)
+        if _is_already_processed(s3, BUCKET, marker_key):
+            print(f"[Skip] Already processed: s3://{BUCKET}/{marker_key}")
+            return
+
+        run_day = datetime.utcnow().strftime("%Y%m%d")
+        day_prefix = f"{BRONZE_ROOT}/{run_day}/"
+        # Ensure day prefix marker
+        try:
+            s3.head_object(Bucket=BUCKET, Key=day_prefix + ".keep")
+        except s3.exceptions.ClientError:
+            s3.put_object(Bucket=BUCKET, Key=day_prefix + ".keep", Body=b"")
+
+        uploaded = []
+        # Build usecols filter: only columns we care about
+        wanted_norm = { _norm(c) for c in TARGET_COLS_IN_ORDER }
+        usecols = lambda c: _norm(c) in wanted_norm
+
+        # Open once, then iterate sheets
+        try:
+            engine = "openpyxl" if src.suffix.lower() == ".xlsx" else None
+            xls = pd.ExcelFile(src, engine=engine)
+        except Exception as e:
+            print(f"[Skip] Cannot open workbook {src}: {e}")
+            return
+
+        for sheet in xls.sheet_names:
+            try:
+                # Fast path: read only needed cols, no type inference
+                df = pd.read_excel(
+                    xls,
+                    sheet_name=sheet,
+                    usecols=usecols,
+                    dtype="string",
+                )
+            except Exception as e:
+                # Fallback: parse via ExcelFile.parse (some engines require)
+                try:
+                    df = xls.parse(sheet_name=sheet, dtype="string")
+                    # Reduce columns post-hoc if fallback path used
+                    df = df.loc[:, [c for c in df.columns if _norm(c) in wanted_norm]]
+                except Exception as ee:
+                    print(f"[Warn] read_sheet failed {src}::{sheet}: {e} | {ee}")
+                    continue
+
+            if df.empty and len(df.columns) == 0:
+                print(f"[Warn] Empty sheet {src}::{sheet}; skipping.")
+                continue
+
+            df = _enforce_schema(df)
+
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            file_stub = f"{_norm(src.stem)}_{_norm(sheet)}_{ts}"
+            key = f"{day_prefix}{file_stub}.parquet"
+
+            try:
+                _write_parquet_direct(df, key)
+                uploaded.append(key)
+                print(f"[Bronze] {src.name}::{sheet} → s3://{BUCKET}/{key}")
+            except Exception as e:
+                print(f"[Warn] Parquet write failed {src}::{sheet}: {e}")
+                continue
+
+        if uploaded:
+            payload = {
+                "file": src.name,
+                "directorate": DIRECTORATE,
+                "path_root": BRONZE_ROOT,
+                "source_relpath": src.relative_to(INBOX_DIR).as_posix(),
+                "run_day": run_day,
+                "uploaded_keys": uploaded,
+                "marked_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=marker_key,
+                Body=json.dumps(payload).encode("utf-8"),
+                ContentType="application/json",
+            )
+            print(f"[Marked] s3://{BUCKET}/{marker_key}")
+        else:
+            print(f"[Ingest] No sheets written for {src}; left unmarked.")
+
+    # ---- Graph ----
+    _ = ensure_prefixes()
+    files = list_excels()
+    ingest_one.expand(path=files)
+
+ingest_bronze_td_data()
