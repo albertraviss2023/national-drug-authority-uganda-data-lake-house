@@ -11,3 +11,7 @@ $env:AWS_SECRET_ACCESS_KEY = "minioadmin123"
 $env:AWS_REGION           = "us-east-1"
 $env:CATALOG_WAREHOUSE    = "s3://warehouse"
 $env:CATALOG_S3_ENDPOINT  = "http://localhost:9000"
+
+## Activating the env
+python -m venv .venv   
+.\.venv\Scripts\activate       
